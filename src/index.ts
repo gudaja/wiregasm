@@ -12,6 +12,7 @@ import {
   Pref,
   PrefModule,
   PrefSetResult,
+  TailResponse,
   TapConvResponse,
   TapExportObjectResponse,
   TapResponse,
@@ -34,6 +35,89 @@ const ALLOWED_GRAPH_KEYS = new Set([
   ...Array.from({ length: 9 }, (_, i) => `filter${i}`),
 ]);
 
+const PCAPNG_BLOCK_TYPE_SHB = 0x0a0d0d0a;
+const PCAPNG_BYTE_ORDER_MAGIC = 0x1a2b3c4d;
+const PCAPNG_MIN_BLOCK_SIZE = 12;
+
+/**
+ * Endianness of the first section of a pcapng buffer.
+ *
+ * @param data Buffer that starts a capture file
+ * @param defaultLittleEndian Used when the buffer does not start with a SHB
+ */
+function sectionEndianness(data: ArrayBufferView, defaultLittleEndian = true) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+  if (
+    view.byteLength < PCAPNG_MIN_BLOCK_SIZE ||
+    view.getUint32(0, true) !== PCAPNG_BLOCK_TYPE_SHB
+  ) {
+    return defaultLittleEndian;
+  }
+
+  return view.getUint32(8, true) === PCAPNG_BYTE_ORDER_MAGIC;
+}
+
+/**
+ * Verify that a buffer holds nothing but whole pcapng blocks.
+ *
+ * Only whole blocks may be appended to a live session, a partial block
+ * terminates the tail in the library (WTAP_ERR_SHORT_READ).
+ *
+ * Appended chunks usually hold nothing but Enhanced Packet Blocks, so the
+ * endianness of the section they belong to has to be supplied by the caller;
+ * a Section Header Block in the buffer overrides it from that point on.
+ *
+ * @param data Buffer that is about to be appended
+ * @param defaultLittleEndian Endianness of the section the buffer continues
+ * @returns Endianness in effect at the end of the buffer
+ * @throws Error if the buffer does not end on a block boundary
+ */
+export function validatePcapngBlocks(
+  data: ArrayBufferView,
+  defaultLittleEndian = true
+): boolean {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+  let littleEndian = defaultLittleEndian;
+  let offset = 0;
+
+  while (offset < view.byteLength) {
+    const left = view.byteLength - offset;
+
+    if (left < PCAPNG_MIN_BLOCK_SIZE) {
+      throw new Error(
+        `incomplete pcapng block at offset ${offset}: ${left} bytes left`
+      );
+    }
+
+    // the block type of a SHB reads the same in both endiannesses, its
+    // byte-order magic tells how the rest of the section is encoded
+    if (view.getUint32(offset, true) === PCAPNG_BLOCK_TYPE_SHB) {
+      littleEndian =
+        view.getUint32(offset + 8, true) === PCAPNG_BYTE_ORDER_MAGIC;
+    }
+
+    const length = view.getUint32(offset + 4, littleEndian);
+
+    if (length < PCAPNG_MIN_BLOCK_SIZE || length % 4 !== 0) {
+      throw new Error(
+        `invalid pcapng block length (${length}) at offset ${offset}`
+      );
+    }
+
+    if (length > left) {
+      throw new Error(
+        `incomplete pcapng block at offset ${offset}: ${length} bytes expected, ${left} left`
+      );
+    }
+
+    offset += length;
+  }
+
+  return littleEndian;
+}
+
 /**
  * Wraps the WiregasmLib lib functionality and manages a single DissectSession
  */
@@ -41,12 +125,23 @@ export class Wiregasm {
   lib: WiregasmLib;
   initialized: boolean;
   session: DissectSession | null;
+  sessionPath: string | null;
   uploadDir: string;
   pluginsDir: string;
+
+  // the session accepts appends, i.e. it was loaded in live mode and the
+  // tail was neither finished nor broken by an error
+  private tailOpen: boolean;
+
+  // endianness of the pcapng section the file of the session ends with
+  private tailLittleEndian: boolean;
 
   constructor() {
     this.initialized = false;
     this.session = null;
+    this.sessionPath = null;
+    this.tailOpen = false;
+    this.tailLittleEndian = true;
   }
 
   /**
@@ -222,16 +317,104 @@ export class Wiregasm {
     data: string | ArrayBufferView,
     opts: object = {}
   ): LoadResponse {
+    return this.load_session(name, data, opts, false);
+  }
+
+  /**
+   * Load a packet trace file in live (tail) mode.
+   *
+   * The sequential handle of the file is kept open, so that whole pcapng
+   * blocks appended with `append()` can be read by the session. Only
+   * uncompressed files are supported.
+   *
+   * @returns Response containing the status and summary
+   */
+  load_live(
+    name: string,
+    data: string | ArrayBufferView,
+    opts: object = {}
+  ): LoadResponse {
+    return this.load_session(name, data, opts, true);
+  }
+
+  private load_session(
+    name: string,
+    data: string | ArrayBufferView,
+    opts: object,
+    live: boolean
+  ): LoadResponse {
     if (this.session != null) {
       this.session.delete();
+      this.session = null;
     }
 
     const path = this.uploadDir + "/" + name;
     this.lib.FS.writeFile(path, data, opts);
 
-    this.session = new this.lib.DissectSession(path);
+    this.sessionPath = path;
+    this.tailOpen = false;
+    this.tailLittleEndian =
+      typeof data === "string" ? true : sectionEndianness(data);
 
-    return this.session.load();
+    this.session = live
+      ? new this.lib.DissectSession(path, true)
+      : new this.lib.DissectSession(path);
+
+    const ret = this.session.load();
+
+    if (live && ret.code === 0) {
+      this.tailOpen = true;
+    }
+
+    return ret;
+  }
+
+  /**
+   * Append data to the capture file of a live session and dissect the
+   * records that were appended.
+   *
+   * Only whole pcapng blocks may be appended, the buffer is validated
+   * before it is written.
+   *
+   * @param data Buffer holding whole pcapng blocks
+   * @returns Response containing the status and the new frame counts
+   */
+  append(data: ArrayBufferView): TailResponse {
+    if (this.session === null || this.sessionPath === null) {
+      throw new Error("No session loaded");
+    }
+
+    if (!this.tailOpen) {
+      throw new Error("session is not tailable");
+    }
+
+    const littleEndian = validatePcapngBlocks(data, this.tailLittleEndian);
+
+    this.lib.FS.writeFile(this.sessionPath, data, { flags: "a" });
+    this.tailLittleEndian = littleEndian;
+
+    const ret = this.session.continueTail();
+
+    if (ret.code !== 0) {
+      // the session does not accept further appends
+      this.tailOpen = false;
+    }
+
+    return ret;
+  }
+
+  /**
+   * Close the sequential handle of a live session. The frames that were
+   * already read stay readable, further `append()` calls fail.
+   */
+  finish_tail(): boolean {
+    if (this.session === null) {
+      throw new Error("No session loaded");
+    }
+
+    this.tailOpen = false;
+
+    return this.session.finishTail();
   }
 
   /**
@@ -263,6 +446,8 @@ export class Wiregasm {
       if (this.session !== null) {
         this.session.delete();
         this.session = null;
+        this.sessionPath = null;
+        this.tailOpen = false;
       }
 
       this.lib.destroy();

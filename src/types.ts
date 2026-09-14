@@ -159,6 +159,29 @@ export interface LoadResponse {
   summary: LoadSummary;
 }
 
+export interface TailResponse {
+  /**
+   * 0 on success, non-zero if the appended records could not be read
+   */
+  code: number;
+  error: string;
+
+  /**
+   * Number of frames added by this call
+   */
+  new_frames: number;
+
+  /**
+   * Total number of frames in the session
+   */
+  packet_count: number;
+
+  /**
+   * Current size of the capture file in bytes
+   */
+  file_length: number;
+}
+
 export interface Download {
   file: string;
   mime: string;
@@ -258,6 +281,21 @@ export interface DissectSession {
   load(): LoadResponse;
 
   /**
+   * Read the records appended to the capture file since the last read.
+   *
+   * Only available for sessions created with `live` set to true; returns a
+   * response with a non-zero code otherwise, or after `finishTail()` or after
+   * a partial block was appended.
+   */
+  continueTail(): TailResponse;
+
+  /**
+   * Close the sequential handle of the capture file. The frames that were
+   * already read stay readable, further `continueTail()` calls fail.
+   */
+  finishTail(): boolean;
+
+  /**
    * Get Packet List information for a range of packets.
    *
    * @param filter Output those frames that pass this filter expression
@@ -286,7 +324,7 @@ export interface DissectSession {
 }
 
 export interface DissectSessionConstructable {
-  new (path: string): DissectSession;
+  new (path: string, live?: boolean): DissectSession;
 }
 
 export interface CheckFilterResponse {

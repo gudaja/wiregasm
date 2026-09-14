@@ -504,7 +504,9 @@ CheckFilterResponse wg_check_filter(string filter) {
   return res;
 }
 
-DissectSession::DissectSession(string _path) : path(_path) {
+DissectSession::DissectSession(string _path) : DissectSession(_path, false) {}
+
+DissectSession::DissectSession(string _path, bool _live) : path(_path), live(_live), tail_open(false) {
   cap_file_init(&this->capture_file);
   build_column_format_array(&this->capture_file.cinfo, prefs_p->num_cols, TRUE);
   this->filter_table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, wg_session_filter_free);
@@ -513,11 +515,11 @@ DissectSession::DissectSession(string _path) : path(_path) {
 LoadResponse DissectSession::load() {
   char *err_ret = NULL;
 
-  LoadResponse r;
+  LoadResponse r{};
 
-  summary_tally s;
+  summary_tally s = {};
 
-  int ret = wg_session_process_load(&this->capture_file, this->path.c_str(), &s, &err_ret);
+  int ret = wg_session_process_load(&this->capture_file, this->path.c_str(), &s, &err_ret, this->live);
 
   r.code = ret;
 
@@ -526,17 +528,85 @@ LoadResponse DissectSession::load() {
     g_free(err_ret);
   }
 
-  // populate summary
-  r.summary.filename = string(s.filename);
-  r.summary.file_type = string(wtap_file_type_subtype_description(s.file_type));
-  r.summary.file_encap_type = string(wtap_encap_description(s.file_encap_type));
-  r.summary.file_length = s.file_length;
-  r.summary.packet_count = s.packet_count;
-  r.summary.start_time = s.start_time;
-  r.summary.stop_time = s.stop_time;
-  r.summary.elapsed_time = s.elapsed_time;
+  if (this->live && ret == 0) {
+    // the sequential handle is kept open, continueTail() can read the
+    // records appended to the file
+    this->tail_open = true;
+  }
+
+  // populate summary, it is only filled in if the file was opened
+  if (s.filename != NULL) {
+    r.summary.filename = string(s.filename);
+    r.summary.file_type = string(wtap_file_type_subtype_description(s.file_type));
+    r.summary.file_encap_type = string(wtap_encap_description(s.file_encap_type));
+    r.summary.file_length = s.file_length;
+    r.summary.packet_count = s.packet_count;
+    r.summary.start_time = s.start_time;
+    r.summary.stop_time = s.stop_time;
+    r.summary.elapsed_time = s.elapsed_time;
+  }
 
   return r;
+}
+
+unsigned int DissectSession::fileLength() {
+  if (this->capture_file.provider.wth == NULL)
+    return 0;
+
+  int err = 0;
+  int64_t file_length = wtap_file_size(this->capture_file.provider.wth, &err);
+
+  return (file_length > 0) ? (unsigned int)file_length : 0;
+}
+
+TailResponse DissectSession::continueTail() {
+  char *err_ret = NULL;
+  guint32 new_frames = 0;
+
+  TailResponse r{};
+
+  r.code = 0;
+  r.new_frames = 0;
+  r.packet_count = (unsigned int)this->capture_file.count;
+  r.file_length = this->fileLength();
+
+  if (!this->live || !this->tail_open) {
+    r.code = WG_TAIL_ERROR;
+    r.error = this->live ? string("Tail is closed") : string("Session is not in live mode");
+    return r;
+  }
+
+  int ret = wg_continue_tail(&this->capture_file, &new_frames, &err_ret);
+
+  r.code = ret;
+  r.new_frames = (unsigned int)new_frames;
+  r.packet_count = (unsigned int)this->capture_file.count;
+  r.file_length = this->fileLength();
+
+  if (err_ret) {
+    r.error = string(err_ret);
+    g_free(err_ret);
+  }
+
+  if (ret != WG_TAIL_OK) {
+    // after an error the position in the stream is not usable any more
+    // (a short read leaves it behind the truncated block), so nothing more
+    // can be appended to this session
+    this->tail_open = false;
+  }
+
+  return r;
+}
+
+bool DissectSession::finishTail() {
+  if (!this->tail_open)
+    return false;
+
+  int ret = wg_finish_tail(&this->capture_file);
+
+  this->tail_open = false;
+
+  return ret == WG_TAIL_OK;
 }
 
 Follow DissectSession::follow(string follow, string filter) {

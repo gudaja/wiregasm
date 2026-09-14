@@ -43,6 +43,7 @@ extern void on_status(enum StatusType, const char *);
 struct wg_filter_item {
   guint8 *filtered; /* can be NULL if all frames are matching for given filter. */
   guint passed;
+  guint computed_count; /* number of frames the bitmap was computed for */
 };
 
 enum dissect_request_status {
@@ -64,8 +65,18 @@ typedef void (*wg_dissect_func_t)(capture_file *cfile, epan_dissect_t *edt, prot
 #define WG_DISSECT_FLAG_PROTO_TREE 0x04u
 #define WG_DISSECT_FLAG_COLOR 0x08u
 
+/* return codes of wg_continue_tail() */
+#define WG_TAIL_OK 0
+#define WG_TAIL_ERROR 1
+#define WG_TAIL_SHORT_READ 2 /* terminal: a partial block was appended */
+
 void wg_session_filter_free(gpointer data);
-int wg_session_process_load(capture_file *cfile, const char *path, summary_tally *summary, char **err_ret);
+int wg_load_cap_file(capture_file *cfile, summary_tally *summary, bool keep_open);
+int wg_session_process_load(capture_file *cfile, const char *path, summary_tally *summary, char **err_ret, bool keep_open);
+/* Must not be called after wg_finish_tail(), which closes the sequential
+   handle; both report WG_TAIL_ERROR through cf->state in that case. */
+int wg_continue_tail(capture_file *cfile, guint32 *new_frames, char **err_ret);
+int wg_finish_tail(capture_file *cfile);
 FramesResponse wg_process_frames(capture_file *cfile, GHashTable *filter_table, const char *filter, guint32 skip, guint32 limit, char **err_ret);
 Frame wg_process_frame(capture_file *cfile, guint32 framenum, char **err_ret);
 Follow wg_process_follow(capture_file *cfile, const char *follow, const char *filter, char **err_ret);

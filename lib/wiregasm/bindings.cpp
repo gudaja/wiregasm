@@ -25,7 +25,10 @@ EMSCRIPTEN_BINDINGS(Wiregasm) {
 EMSCRIPTEN_BINDINGS(DissectSession) {
   class_<DissectSession>("DissectSession")
       .constructor<std::string>()
+      .constructor<std::string, bool>()
       .function("load", &DissectSession::load)
+      .function("continueTail", &DissectSession::continueTail)
+      .function("finishTail", &DissectSession::finishTail)
       .function("getFrames", &DissectSession::getFrames)
       .function("getFrame", &DissectSession::getFrame)
       .function("tap", &DissectSession::tap)
@@ -128,6 +131,15 @@ EMSCRIPTEN_BINDINGS(FramesResponse) {
   value_object<FramesResponse>("FramesResponse")
       .field("frames", &FramesResponse::frames)
       .field("matched", &FramesResponse::matched);
+}
+
+EMSCRIPTEN_BINDINGS(TailResponse) {
+  value_object<TailResponse>("TailResponse")
+      .field("code", &TailResponse::code)
+      .field("error", &TailResponse::error)
+      .field("new_frames", &TailResponse::new_frames)
+      .field("packet_count", &TailResponse::packet_count)
+      .field("file_length", &TailResponse::file_length);
 }
 
 EMSCRIPTEN_BINDINGS(CheckFilterResponse) {

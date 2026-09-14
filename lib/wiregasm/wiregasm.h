@@ -89,6 +89,14 @@ struct FramesResponse {
   unsigned int matched;
 };
 
+struct TailResponse {
+  int code;
+  string error;
+  unsigned int new_frames;
+  unsigned int packet_count;
+  unsigned int file_length;
+};
+
 struct CheckFilterResponse {
   bool ok;
   string error;
@@ -264,10 +272,17 @@ private:
   string path;
   capture_file capture_file;
   GHashTable *filter_table;
+  bool live;      // the sequential handle is kept open by load()
+  bool tail_open; // the sequential handle is still open
+
+  unsigned int fileLength();
 
 public:
   DissectSession(string _path);
+  DissectSession(string _path, bool _live);
   LoadResponse load();
+  TailResponse continueTail();
+  bool finishTail();
   FramesResponse getFrames(string filter, int skip, int limit);
   Frame getFrame(int number);
   Follow follow(string follow, string filter);

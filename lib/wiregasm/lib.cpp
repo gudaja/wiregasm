@@ -1,6 +1,5 @@
 #include "lib.h"
 
-static guint32 cum_bytes;
 static frame_data ref_frame;
 
 #define WG_IOGRAPH_MAX_ITEMS 250000 /* 250k limit of items is taken from wireshark-qt, on x86_64 sizeof(io_graph_item_t) is 152, so single graph can take max 36 MB */
@@ -121,6 +120,7 @@ cf_open(capture_file *cf, const char *fname, unsigned int type, gboolean is_temp
   cf->cd_t = wtap_file_type_subtype(cf->provider.wth);
   cf->open_type = type;
   cf->count = 0;
+  cf->cum_bytes = 0;
   cf->drops_known = FALSE;
   cf->drops = 0;
   cf->snap = wtap_snapshot_length(cf->provider.wth);
@@ -163,7 +163,7 @@ process_packet(capture_file *cf, epan_dissect_t *edt,
 
   /* The frame number of this packet, if we add it to the set of frames,
      would be one more than the count of frames in the file so far. */
-  frame_data_init(&fdlocal, cf->count + 1, rec, offset, cum_bytes);
+  frame_data_init(&fdlocal, cf->count + 1, rec, offset, cf->cum_bytes);
 
   /* If we're going to print packet information, or we're going to
      run a read filter, or display filter, or we're going to process taps, set up to
@@ -203,7 +203,7 @@ process_packet(capture_file *cf, epan_dissect_t *edt,
   }
 
   if (passed) {
-    frame_data_set_after_dissect(&fdlocal, &cum_bytes);
+    frame_data_set_after_dissect(&fdlocal, &cf->cum_bytes);
     cf->provider.prev_cap = cf->provider.prev_dis = frame_data_sequence_add(cf->provider.frames, &fdlocal);
 
     cf->f_datalen = offset + fdlocal.cap_len;
@@ -232,13 +232,46 @@ process_packet(capture_file *cf, epan_dissect_t *edt,
   return passed;
 }
 
-static int
-load_cap_file(capture_file *cf, int max_packet_count, gint64 max_byte_count, summary_tally *summary) {
-  int err;
-  gchar *err_info = NULL;
+/*
+ * Read all the records that are available on the sequential handle of cf,
+ * dissecting and adding them to the frame data sequence.
+ *
+ * On return *err is 0 if the end of the available data was reached cleanly,
+ * otherwise it holds the wiretap error (and *err_info the detail string, which
+ * the caller has to free). *added, if not NULL, gets the number of records
+ * that were added to the capture file.
+ */
+static void
+read_records(capture_file *cf, epan_dissect_t *edt, guint32 *added, int *err, gchar **err_info) {
   gint64 data_offset;
   wtap_rec rec;
   Buffer buf;
+  guint32 count = 0;
+
+  *err = 0;
+  *err_info = NULL;
+
+  wtap_rec_init(&rec);
+  ws_buffer_init(&buf, 1514);
+
+  while (wtap_read(cf->provider.wth, &rec, &buf, err, err_info, &data_offset)) {
+    if (process_packet(cf, edt, data_offset, &rec, &buf)) {
+      count++;
+      wtap_rec_reset(&rec);
+    }
+  }
+
+  wtap_rec_cleanup(&rec);
+  ws_buffer_free(&buf);
+
+  if (added)
+    *added = count;
+}
+
+static int
+load_cap_file(capture_file *cf, summary_tally *summary, bool keep_open) {
+  int err = 0;
+  gchar *err_info = NULL;
   epan_dissect_t *edt = NULL;
 
   {
@@ -267,41 +300,32 @@ load_cap_file(capture_file *cf, int max_packet_count, gint64 max_byte_count, sum
       edt = epan_dissect_new(cf->epan, create_proto_tree, FALSE);
     }
 
-    wtap_rec_init(&rec);
-    ws_buffer_init(&buf, 1514);
-
-    while (wtap_read(cf->provider.wth, &rec, &buf, &err, &err_info, &data_offset)) {
-      if (process_packet(cf, edt, data_offset, &rec, &buf)) {
-        wtap_rec_reset(&rec);
-        /* Stop reading if we have the maximum number of packets;
-         * When the -c option has not been used, max_packet_count
-         * starts at 0, which practically means, never stop reading.
-         * (unless we roll over max_packet_count ?)
-         */
-        if ((--max_packet_count == 0) || (max_byte_count != 0 && data_offset >= max_byte_count)) {
-          err = 0; /* This is not an error */
-          break;
-        }
-      }
-    }
+    read_records(cf, edt, NULL, &err, &err_info);
 
     if (edt) {
       epan_dissect_free(edt);
       edt = NULL;
     }
 
-    wtap_rec_cleanup(&rec);
-    ws_buffer_free(&buf);
+    if (!keep_open) {
+      /* Close the sequential I/O side, to free up memory it requires. */
+      wtap_sequential_close(cf->provider.wth);
 
-    /* Close the sequential I/O side, to free up memory it requires. */
-    wtap_sequential_close(cf->provider.wth);
+      /* Allow the protocol dissectors to free up memory that they
+       * don't need after the sequential run-through of the packets. */
+      postseq_cleanup_all_protocols();
 
-    /* Allow the protocol dissectors to free up memory that they
-     * don't need after the sequential run-through of the packets. */
-    postseq_cleanup_all_protocols();
+      cf->provider.prev_dis = NULL;
+      cf->provider.prev_cap = NULL;
 
-    cf->provider.prev_dis = NULL;
-    cf->provider.prev_cap = NULL;
+      /* the sequential handle is gone, wg_continue_tail() must refuse to
+         read from it */
+      cf->state = FILE_READ_DONE;
+    }
+    /* In keep_open (live/tail) mode the sequential handle stays open so that
+     * records appended to the file can be read by wg_continue_tail(), and
+     * prev_dis/prev_cap are kept so that the time deltas of the records read
+     * later on are correct. */
   }
 
   cf->lnk_t = wtap_file_encap(cf->provider.wth);
@@ -315,8 +339,123 @@ load_cap_file(capture_file *cf, int max_packet_count, gint64 max_byte_count, sum
   return err;
 }
 
-int wg_load_cap_file(capture_file *cfile, summary_tally *summary) {
-  return load_cap_file(cfile, 0, 0, summary);
+int wg_load_cap_file(capture_file *cfile, summary_tally *summary, bool keep_open) {
+  return load_cap_file(cfile, summary, keep_open);
+}
+
+/*
+ * Read the records that were appended to the capture file since the last
+ * read. The sequential handle has to be still open, i.e. the file has to be
+ * loaded with keep_open set and wg_finish_tail() must not have been called
+ * (which is rejected here through cf->state).
+ *
+ * Returns WG_TAIL_OK, WG_TAIL_ERROR or WG_TAIL_SHORT_READ; for the latter two
+ * *err_ret holds an error string that the caller has to free.
+ */
+int wg_continue_tail(capture_file *cf, guint32 *new_frames, char **err_ret) {
+  volatile int ret = WG_TAIL_OK;
+  int err = 0;
+  gchar *err_info = NULL;
+  guint32 added = 0;
+  epan_dissect_t *edt;
+  gboolean create_proto_tree;
+
+  if (new_frames)
+    *new_frames = 0;
+
+  if (cf->provider.wth == NULL) {
+    *err_ret = g_strdup_printf("The capture file is not open");
+    return WG_TAIL_ERROR;
+  }
+
+  if (cf->state != FILE_READ_IN_PROGRESS) {
+    /* wg_finish_tail() closed the sequential side of the file; reading it
+       again would dereference a handle that is gone. */
+    *err_ret = g_strdup_printf("sequential handle closed");
+    return WG_TAIL_ERROR;
+  }
+
+  /* We're at EOF from the previous read; unset it so that the records
+     appended to the file since then can be read. */
+  wtap_cleareof(cf->provider.wth);
+
+  /* Same condition as in load_cap_file(). */
+  create_proto_tree =
+      (cf->rfcode != NULL || cf->dfcode != NULL || postdissectors_want_hfids());
+
+  edt = epan_dissect_new(cf->epan, create_proto_tree, FALSE);
+
+  TRY {
+    read_records(cf, edt, &added, &err, &err_info);
+  }
+  CATCH(OutOfMemoryError) {
+    *err_ret = g_strdup_printf("Tail read failed, out of memory");
+    ret = ENOMEM;
+  }
+  ENDTRY;
+
+  /* Update the file encapsulation; it might have changed based on the
+     records we've read. */
+  cf->lnk_t = wtap_file_encap(cf->provider.wth);
+
+  if (edt) {
+    epan_dissect_free(edt);
+    edt = NULL;
+  }
+
+  if (ret == WG_TAIL_OK && err != 0) {
+    if (err == WTAP_ERR_SHORT_READ) {
+      /* Only a part of a block was appended. The stream position is now
+         behind the truncated block and wtap_cleareof() does not rewind it,
+         so this is terminal for the session. */
+      *err_ret = g_strdup_printf("short read: partial block appended");
+      ret = WG_TAIL_SHORT_READ;
+    } else if (err_info != NULL) {
+      *err_ret = g_strdup_printf("%s (%s)", wtap_strerror(err), err_info);
+      ret = WG_TAIL_ERROR;
+    } else {
+      *err_ret = g_strdup_printf("%s", wtap_strerror(err));
+      ret = WG_TAIL_ERROR;
+    }
+  }
+
+  g_free(err_info);
+
+  if (new_frames)
+    *new_frames = added;
+
+  return ret;
+}
+
+/*
+ * Read whatever is left in the capture file and close the sequential side of
+ * it; the frames stay readable through the random handle.
+ */
+int wg_finish_tail(capture_file *cf) {
+  char *err_ret = NULL;
+
+  if (cf->provider.wth == NULL || cf->state != FILE_READ_IN_PROGRESS)
+    return WG_TAIL_ERROR;
+
+  /* Read the records that are still there, like cf_finish_tail() does. */
+  wg_continue_tail(cf, NULL, &err_ret);
+
+  // XXX: propagate?
+  g_free(err_ret);
+
+  /* Close the sequential I/O side, to free up memory it requires. */
+  wtap_sequential_close(cf->provider.wth);
+
+  /* Allow the protocol dissectors to free up memory that they
+   * don't need after the sequential run-through of the packets. */
+  postseq_cleanup_all_protocols();
+
+  cf->provider.prev_dis = NULL;
+  cf->provider.prev_cap = NULL;
+
+  cf->state = FILE_READ_DONE;
+
+  return WG_TAIL_OK;
 }
 
 int wg_retap(capture_file *cfile) {
@@ -379,7 +518,7 @@ int wg_retap(capture_file *cfile) {
   return 0;
 }
 
-int wg_session_process_load(capture_file *cfile, const char *path, summary_tally *summary, char **err_ret) {
+int wg_session_process_load(capture_file *cfile, const char *path, summary_tally *summary, char **err_ret, bool keep_open) {
   int ret = 0;
 
   if (!path)
@@ -390,8 +529,16 @@ int wg_session_process_load(capture_file *cfile, const char *path, summary_tally
     return 1;
   }
 
+  if (keep_open && wtap_get_compression_type(cfile->provider.wth) != WTAP_UNCOMPRESSED) {
+    /* The sequential handle of a compressed file cannot be tailed - the
+     * decompressor state does not survive the appended data. */
+    *err_ret = g_strdup_printf("Live mode requires an uncompressed capture file");
+    cf_close(cfile);
+    return 1;
+  }
+
   TRY {
-    ret = wg_load_cap_file(cfile, summary);
+    ret = wg_load_cap_file(cfile, summary, keep_open);
   }
   CATCH(OutOfMemoryError) {
     *err_ret = g_strdup_printf("Load failed, out of memory");
@@ -764,54 +911,44 @@ wg_dissect_request(capture_file *cfile, guint32 framenum, guint32 frame_ref_num,
   return DISSECT_REQUEST_SUCCESS;
 }
 
-int wg_filter(capture_file *cfile, const char *dftext, guint8 **result, guint *passed) {
-  dfilter_t *dfcode = NULL;
+/* size of the bitmap holding one bit per frame, for frames_count frames */
+#define WG_FILTER_BITMAP_SIZE(frames_count) (2 + ((frames_count) / 8))
 
-  guint32 framenum, prev_dis_num = 0;
-  guint32 frames_count;
+/*
+ * Dissect the frames first..last and set the bit of every frame matching
+ * dfcode in the bits bitmap; bit (framenum % 8) of byte (framenum / 8), the
+ * layout wg_process_frames() reads. The bitmap must be big enough for last
+ * frames and the bits of the frames in the range must be zeroed by the caller.
+ *
+ * prev_dis_num is the number of the last frame that matched before first;
+ * *passed is incremented for every matching frame.
+ */
+static void
+wg_filter_frames(capture_file *cfile, dfilter_t *dfcode, guint8 *bits,
+                 guint32 first, guint32 last, guint32 prev_dis_num, guint *passed) {
+  guint32 framenum;
   Buffer buf;
   wtap_rec rec;
   int err;
   char *err_info = NULL;
-
-  guint passed_frames = 0;
-  guint8 *result_bits;
-  guint8 passed_bits;
-
   epan_dissect_t edt;
-
-  df_error_t *dferr = NULL;
-  if (!dfilter_compile(dftext, &dfcode, &dferr)) {
-    g_free(dferr);
-    return -1;
-  }
-
-  /* if dfilter_compile() success, but (dfcode == NULL) all frames are matching */
-  if (dfcode == NULL) {
-    *result = NULL;
-    *passed = cfile->count;
-    return 0;
-  }
-
-  frames_count = cfile->count;
 
   wtap_rec_init(&rec);
   ws_buffer_init(&buf, 1514);
   epan_dissect_init(&edt, cfile->epan, TRUE, FALSE);
 
-  passed_bits = 0;
-  result_bits = (guint8 *)g_malloc(2 + (frames_count / 8));
-
-  for (framenum = 1; framenum <= frames_count; framenum++) {
+  for (framenum = first; framenum <= last; framenum++) {
     frame_data *fdata = wg_get_frame(cfile, framenum);
 
-    if ((framenum & 7) == 0) {
-      result_bits[(framenum / 8) - 1] = passed_bits;
-      passed_bits = 0;
-    }
-
-    if (!wtap_seek_read(cfile->provider.wth, fdata->file_off, &rec, &buf, &err, &err_info))
+    if (fdata == NULL)
       break;
+
+    if (!wtap_seek_read(cfile->provider.wth, fdata->file_off, &rec, &buf, &err, &err_info)) {
+      // XXX: propagate?
+      g_free(err_info);
+      err_info = NULL;
+      break;
+    }
 
     /* frame_data_set_before_dissect */
     epan_dissect_prime_with_dfilter(&edt, dfcode);
@@ -824,9 +961,9 @@ int wg_filter(capture_file *cfile, const char *dftext, guint8 **result, guint *p
                      fdata, NULL);
 
     if (dfilter_apply_edt(dfcode, &edt)) {
-      passed_bits |= (1 << (framenum % 8));
+      bits[framenum / 8] |= (1 << (framenum % 8));
       prev_dis_num = framenum;
-      passed_frames++;
+      (*passed)++;
     }
 
     /* if passed or ref -> frame_data_set_after_dissect */
@@ -835,20 +972,111 @@ int wg_filter(capture_file *cfile, const char *dftext, guint8 **result, guint *p
     epan_dissect_reset(&edt);
   }
 
-  if ((framenum & 7) == 0)
-    framenum--;
-  result_bits[framenum / 8] = passed_bits;
-
   wtap_rec_cleanup(&rec);
   ws_buffer_free(&buf);
   epan_dissect_cleanup(&edt);
+}
+
+/* number of the last frame up to count that matched, 0 if there is none */
+static guint32
+wg_filter_last_passed(const guint8 *bits, guint32 count) {
+  guint32 framenum;
+
+  for (framenum = count; framenum >= 1; framenum--) {
+    if (bits[framenum / 8] & (1 << (framenum % 8)))
+      return framenum;
+  }
+
+  return 0;
+}
+
+int wg_filter(capture_file *cfile, const char *dftext, guint8 **result, guint *passed) {
+  dfilter_t *dfcode = NULL;
+
+  guint32 frames_count;
+
+  guint passed_frames = 0;
+  guint8 *result_bits;
+
+  df_error_t *dferr = NULL;
+  if (!dfilter_compile(dftext, &dfcode, &dferr)) {
+    df_error_free(&dferr);
+    return -1;
+  }
+
+  /* if dfilter_compile() success, but (dfcode == NULL) all frames are matching */
+  if (dfcode == NULL) {
+    *result = NULL;
+    *passed = cfile->count;
+    return 0;
+  }
+
+  frames_count = cfile->count;
+
+  result_bits = (guint8 *)g_malloc0(WG_FILTER_BITMAP_SIZE(frames_count));
+
+  wg_filter_frames(cfile, dfcode, result_bits, 1, frames_count, 0, &passed_frames);
 
   dfilter_free(dfcode);
 
   *result = result_bits;
   *passed = passed_frames;
 
-  return framenum;
+  return (int)frames_count;
+}
+
+/*
+ * Bring a cached filter result up to date with the frames that were added to
+ * the capture file since it was computed; only the new frames are dissected.
+ */
+static void
+wg_filter_extend(capture_file *cfile, const char *dftext, struct wg_filter_item *item) {
+  dfilter_t *dfcode = NULL;
+  df_error_t *dferr = NULL;
+  guint32 first, last;
+  gsize old_size, new_size;
+  guint8 *bits;
+
+  if (item->computed_count >= cfile->count)
+    return;
+
+  first = item->computed_count + 1;
+  last = cfile->count;
+
+  /* all frames are matching for this filter, there is no bitmap */
+  if (item->filtered == NULL) {
+    item->passed = last;
+    item->computed_count = last;
+    return;
+  }
+
+  old_size = WG_FILTER_BITMAP_SIZE(item->computed_count);
+  new_size = WG_FILTER_BITMAP_SIZE(last);
+
+  bits = (guint8 *)g_realloc(item->filtered, new_size);
+  if (new_size > old_size)
+    memset(bits + old_size, 0, new_size - old_size);
+  item->filtered = bits;
+
+  /* The bitmap now covers all the frames, so mark them as computed even if
+     the dissection below fails - wg_process_frames() indexes the bitmap with
+     cfile->count. */
+  item->computed_count = last;
+
+  if (!dfilter_compile(dftext, &dfcode, &dferr)) {
+    // XXX: propagate? the filter compiled when the item was created
+    df_error_free(&dferr);
+    return;
+  }
+
+  /* the filter compiles to "match everything", the bitmap is not used */
+  if (dfcode == NULL)
+    return;
+
+  wg_filter_frames(cfile, dfcode, bits, first, last,
+                   wg_filter_last_passed(bits, first - 1), &item->passed);
+
+  dfilter_free(dfcode);
 }
 
 const struct wg_filter_item *
@@ -868,8 +1096,12 @@ session_filter_data(GHashTable *filter_table, capture_file *cfile, const char *f
     l = g_new(struct wg_filter_item, 1);
     l->filtered = filtered;
     l->passed = passed;
+    l->computed_count = cfile->count;
 
     g_hash_table_insert(filter_table, g_strdup(filter), l);
+  } else if (l->computed_count < cfile->count) {
+    /* frames were appended since this filter was computed (live/tail mode) */
+    wg_filter_extend(cfile, filter, l);
   }
 
   return l;

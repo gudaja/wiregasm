@@ -85,6 +85,50 @@ sess.delete();
 wg.destroy();
 ```
 
+### Live / tail mode
+
+A session can be created in live mode, which keeps the sequential handle of the
+capture file open after `load()`. Data appended to the file afterwards is
+dissected by `continueTail()`, without reloading the file:
+
+```javascript
+// create a live session over a file that only holds an SHB and an IDB for now
+const sess = new wg.DissectSession("/uploads/live.pcapng", true);
+sess.load();
+
+// append whole pcapng blocks (e.g. EPBs) to the file and read them
+wg.FS.writeFile("/uploads/live.pcapng", moreBlocks, { flags: "a" });
+const tail = sess.continueTail();
+// tail.code == 0, tail.new_frames, tail.packet_count, tail.file_length
+
+// getFrames/getFrame see the new frames, the filter cache is extended
+// incrementally
+const frames = sess.getFrames("tcp", 0, 0);
+
+// close the sequential handle, the frames stay readable
+sess.finishTail();
+
+sess.delete();
+```
+
+The `Wiregasm` wrapper exposes the same through `load_live(name, data)`,
+`append(data)` and `finish_tail()`; `append()` validates the buffer and writes
+it to the file of the current session before reading the new records. It
+throws if the session does not accept appends (it was not loaded with
+`load_live()`, `finish_tail()` was called, or a previous append failed).
+
+Rules:
+
+* **Only whole pcapng blocks may be appended.** A partial block makes the
+  library read past the truncated data (`WTAP_ERR_SHORT_READ`,
+  `continueTail()` returns `code == 2`), which is terminal: the session does
+  not accept further appends, although the frames read so far stay readable.
+  Any other read error closes the tail as well.
+* **Only uncompressed files are supported.** `load()` of a live session fails
+  with a non-zero code for a compressed (e.g. gzipped) capture file.
+* `continueTail()` returns a non-zero code for a session that was not created
+  with `live = true`, and after `finishTail()`.
+
 To add custom Lua dissectors, add your dissectors to the plugins directory
 before initializing wiregasm:
 
