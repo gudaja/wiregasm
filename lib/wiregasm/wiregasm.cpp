@@ -1,5 +1,6 @@
 #include "wiregasm.h"
 #include "lib.h"
+#include <epan/decode_as.h>
 #include <epan/packet.h>
 #include <epan/prefs-int.h>
 #include <epan/prefs.h>
@@ -235,6 +236,12 @@ bool wg_init() {
 
   prefs_apply_all();
   wg_apply_decode_as_defaults();
+
+  // Load the personal decode_as_entries from the config dir. epan_load_settings()
+  // already reads it, but wg_apply_decode_as_defaults() resets the dissector
+  // tables to the preference defaults afterwards, so load it again here. This is
+  // a no-op when the file is missing.
+  load_decode_as_entries();
 
   on_status(INFO, "Initializing color filters");
 
